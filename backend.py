@@ -1,6 +1,6 @@
 import os
 import json
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -76,6 +76,7 @@ def ask():
     data = request.json
     question = data.get('question')
     parent_id = data.get('parent_id')
+    use_streaming = data.get('stream', False)
 
     if parent_id is not None:
         context = tree.get_context_chain(parent_id)
@@ -84,19 +85,56 @@ def ask():
 
     messages = context + [{'role': 'user', 'content': question}]
 
-    response = client.chat.completions.create(
-        model='gpt-4',
-        messages=messages
-    )
+    if use_streaming:
+        def generate():
+            full_answer = ''
+            stream = client.chat.completions.create(
+                model='gpt-4',
+                messages=messages,
+                stream=True
+            )
 
-    answer = response.choices[0].message.content
-    node_id = tree.add_node(question, answer, parent_id)
+            for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    content = chunk.choices[0].delta.content
+                    full_answer += content
+                    # Send as NDJSON format for simplicity
+                    yield json.dumps({
+                        'type': 'token',
+                        'content': content
+                    }) + '\n'
 
-    return jsonify({
-        'node_id': node_id,
-        'answer': answer,
-        'tree': tree.to_dict()
-    })
+            # After streaming is complete, add to tree and send final update
+            node_id = tree.add_node(question, full_answer, parent_id)
+            yield json.dumps({
+                'type': 'done',
+                'node_id': node_id,
+                'tree': tree.to_dict()
+            }) + '\n'
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype='application/x-ndjson',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no'
+            }
+        )
+    else:
+        # Non-streaming response (original behavior)
+        response = client.chat.completions.create(
+            model='gpt-4',
+            messages=messages
+        )
+
+        answer = response.choices[0].message.content
+        node_id = tree.add_node(question, answer, parent_id)
+
+        return jsonify({
+            'node_id': node_id,
+            'answer': answer,
+            'tree': tree.to_dict()
+        })
 
 @app.route('/api/tree', methods=['GET'])
 def get_tree():
