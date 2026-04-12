@@ -10,7 +10,19 @@ function CanvasView({ tree, onAsk, onClear }) {
   const [selectedNode, setSelectedNode] = useState(null);
   const [inputText, setInputText] = useState('');
   const [loading, setLoading] = useState(false);
+  const [streamingAnswer, setStreamingAnswer] = useState('');
+  const [leftPanelWidth, setLeftPanelWidth] = useState(50);
+  const [isResizing, setIsResizing] = useState(false);
+  const [feedbackMessage, setFeedbackMessage] = useState(null);
   const canvasRef = useRef(null);
+  const nodeRefs = useRef({});
+  const chatEndRef = useRef(null);
+
+  useEffect(() => {
+    if (chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [selectedNode, streamingAnswer]);
 
   useEffect(() => {
     const calculateLayout = () => {
@@ -111,26 +123,191 @@ function CanvasView({ tree, onAsk, onClear }) {
   const handleMouseUp = () => {
     setDragging(null);
     setIsPanning(false);
+    setIsResizing(false);
+  };
+
+  const handleResizeMouseDown = (e) => {
+    e.preventDefault();
+    setIsResizing(true);
+  };
+
+  useEffect(() => {
+    const handleGlobalMouseMove = (e) => {
+      if (isResizing) {
+        const containerWidth = window.innerWidth;
+        const newLeftWidth = (e.clientX / containerWidth) * 100;
+        if (newLeftWidth >= 10 && newLeftWidth <= 90) {
+          setLeftPanelWidth(newLeftWidth);
+        }
+      }
+    };
+
+    const handleGlobalMouseUp = () => {
+      setIsResizing(false);
+    };
+
+    if (isResizing) {
+      document.addEventListener('mousemove', handleGlobalMouseMove);
+      document.addEventListener('mouseup', handleGlobalMouseUp);
+    }
+
+    return () => {
+      document.removeEventListener('mousemove', handleGlobalMouseMove);
+      document.removeEventListener('mouseup', handleGlobalMouseUp);
+    };
+  }, [isResizing]);
+
+  const showFeedback = (message, duration = 3000) => {
+    setFeedbackMessage(message);
+    setTimeout(() => setFeedbackMessage(null), duration);
+  };
+
+  const handleSaveContext = (name) => {
+    try {
+      const contexts = JSON.parse(localStorage.getItem('treeContexts') || '{}');
+      contexts[name] = {
+        tree: tree,
+        savedAt: new Date().toISOString()
+      };
+      localStorage.setItem('treeContexts', JSON.stringify(contexts));
+      showFeedback(`saved as "${name}"`);
+    } catch (error) {
+      console.error('Error saving context:', error);
+      showFeedback('failed to save');
+    }
+  };
+
+  const handleLoadContext = (name) => {
+    try {
+      const contexts = JSON.parse(localStorage.getItem('treeContexts') || '{}');
+      if (contexts[name]) {
+        onAsk(contexts[name].tree);
+        setSelectedNode(null);
+        showFeedback(`loaded "${name}"`);
+      } else {
+        showFeedback(`"${name}" not found`);
+      }
+    } catch (error) {
+      console.error('Error loading context:', error);
+      showFeedback('failed to load');
+    }
+  };
+
+  const handleListContexts = () => {
+    try {
+      const contexts = JSON.parse(localStorage.getItem('treeContexts') || '{}');
+      const contextNames = Object.keys(contexts);
+
+      if (contextNames.length === 0) {
+        alert('No saved contexts.\nUse /save [name] to save a context');
+      } else {
+        const contextList = contextNames.map(name => {
+          const date = new Date(contexts[name].savedAt).toLocaleString();
+          const nodeCount = Object.keys(contexts[name].tree.nodes || {}).length;
+          return `${name} - ${nodeCount} nodes (saved: ${date})`;
+        }).join('\n');
+        alert(`Saved contexts:\n\n${contextList}\n\nUse /load [name] to load a context`);
+      }
+    } catch (error) {
+      console.error('Error listing contexts:', error);
+      alert('Failed to list contexts');
+    }
   };
 
   const handleAsk = async (parentId) => {
     if (!inputText.trim() || loading) return;
 
-    setLoading(true);
-    const response = await fetch('http://localhost:5001/api/ask', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question: inputText,
-        parent_id: parentId
-      })
-    });
-
-    const data = await response.json();
-    onAsk(data.tree);
+    const currentQuestion = inputText.trim();
     setInputText('');
-    setSelectedNode(data.node_id);
-    setLoading(false);
+
+    // Handle commands
+    if (currentQuestion.startsWith('/')) {
+      const [command, ...args] = currentQuestion.split(' ');
+
+      switch (command.toLowerCase()) {
+        case '/save':
+          handleSaveContext(args.join(' ') || 'default');
+          return;
+        case '/load':
+          handleLoadContext(args.join(' ') || 'default');
+          return;
+        case '/list':
+          handleListContexts();
+          return;
+        case '/help':
+          alert('Available commands:\n/save [name] - Save current context\n/load [name] - Load saved context\n/list - List all saved contexts\n/help - Show this help');
+          return;
+        default:
+          alert(`Unknown command: ${command}\nType /help for available commands`);
+          return;
+      }
+    }
+
+    setLoading(true);
+    setStreamingAnswer('');
+
+    try {
+      const response = await fetch('http://localhost:5001/api/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: currentQuestion,
+          parent_id: parentId
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error('Network response was not ok');
+      }
+
+      const contentType = response.headers.get('content-type');
+
+      // Check if response is streaming (SSE) or regular JSON
+      if (contentType && contentType.includes('text/event-stream')) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let nodeId = null;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+
+                if (data.type === 'token') {
+                  setStreamingAnswer(prev => prev + data.content);
+                } else if (data.type === 'done') {
+                  onAsk(data.tree);
+                  nodeId = data.node_id;
+                  setSelectedNode(data.node_id);
+                }
+              } catch (e) {
+                console.error('Error parsing SSE data:', e);
+              }
+            }
+          }
+        }
+        setStreamingAnswer('');
+      } else {
+        // Fallback to regular JSON response
+        const data = await response.json();
+        onAsk(data.tree);
+        setSelectedNode(data.node_id);
+      }
+    } catch (error) {
+      console.error('Error asking question:', error);
+      alert('Failed to get response. Please try again.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleNodeClick = (nodeId, e) => {
@@ -138,37 +315,69 @@ function CanvasView({ tree, onAsk, onClear }) {
     setSelectedNode(nodeId);
   };
 
+  const getConversationPath = (nodeId) => {
+    const path = [];
+    let currentId = nodeId;
+
+    while (currentId !== null) {
+      const node = tree.nodes[currentId];
+      if (node) {
+        path.unshift(node);
+        currentId = node.parent_id;
+      } else {
+        break;
+      }
+    }
+
+    return path;
+  };
+
   const renderConnections = () => {
-    const lines = [];
+    const paths = [];
     Object.values(tree.nodes).forEach(node => {
       if (node.parent_id !== null && nodes[node.id] && nodes[node.parent_id]) {
         const parent = nodes[node.parent_id];
         const child = nodes[node.id];
 
-        lines.push(
-          <line
+        const nodeWidth = 200;
+        const padding = 10;
+        const border = 1;
+
+        // Get actual parent node height
+        const parentElement = nodeRefs.current[node.parent_id];
+        const parentHeight = parentElement ? parentElement.offsetHeight : 40;
+
+        const x1 = parent.x + nodeWidth / 2;
+        const y1 = parent.y + parentHeight;
+        const x2 = child.x + nodeWidth / 2;
+        const y2 = child.y;
+
+        const midY = (y1 + y2) / 2;
+
+        const pathD = `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`;
+
+        paths.push(
+          <path
             key={`line-${node.parent_id}-${node.id}`}
-            x1={parent.x + 100}
-            y1={parent.y + 70}
-            x2={child.x + 100}
-            y2={child.y}
+            d={pathD}
             stroke="#333333"
-            strokeWidth="1"
+            strokeWidth="2"
+            fill="none"
           />
         );
       }
     });
-    return lines;
+    return paths;
   };
 
   const selectedNodeData = selectedNode !== null ? tree.nodes[selectedNode] : null;
 
   return (
-    <div style={{ display: 'flex', height: '100vh' }}>
+    <div style={{ display: 'flex', height: '100vh', position: 'relative' }}>
       <div
         ref={canvasRef}
         style={{
-          flex: 1,
+          width: `${leftPanelWidth}%`,
           position: 'relative',
           overflow: 'hidden',
           cursor: isPanning ? 'grabbing' : 'grab',
@@ -210,6 +419,7 @@ function CanvasView({ tree, onAsk, onClear }) {
             return (
               <div
                 key={node.id}
+                ref={(el) => { if (el) nodeRefs.current[node.id] = el; }}
                 style={{
                   position: 'absolute',
                   left: nodes[node.id].x,
@@ -252,13 +462,34 @@ function CanvasView({ tree, onAsk, onClear }) {
       </div>
 
       <div
+        onMouseDown={handleResizeMouseDown}
         style={{
-          flex: 1,
+          width: '4px',
+          cursor: 'col-resize',
+          backgroundColor: isResizing ? '#000000' : '#cccccc',
+          transition: isResizing ? 'none' : 'background-color 0.2s',
+          position: 'relative',
+          zIndex: 10
+        }}
+        onMouseEnter={(e) => {
+          if (!isResizing) {
+            e.currentTarget.style.backgroundColor = '#666666';
+          }
+        }}
+        onMouseLeave={(e) => {
+          if (!isResizing) {
+            e.currentTarget.style.backgroundColor = '#cccccc';
+          }
+        }}
+      />
+
+      <div
+        style={{
+          width: `${100 - leftPanelWidth}%`,
           backgroundColor: '#ffffff',
           display: 'flex',
           flexDirection: 'column',
-          overflow: 'hidden',
-          borderLeft: '1px solid #cccccc'
+          overflow: 'hidden'
         }}
       >
         <div style={{
@@ -288,43 +519,77 @@ function CanvasView({ tree, onAsk, onClear }) {
           </button>
         </div>
 
-        <div style={{ flex: 1, padding: '20px', display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
           {selectedNodeData ? (
           <>
-            <div style={{ marginBottom: '20px' }}>
-              <div style={{ color: '#666666', fontSize: '11px', marginBottom: '8px', textTransform: 'lowercase' }}>
-                question
-              </div>
-              <div style={{ color: '#000000', fontSize: '14px', fontWeight: '500', marginBottom: '20px' }}>
-                {selectedNodeData.question}
-              </div>
+            <div style={{ flex: 1, padding: '20px', overflowY: 'auto' }}>
+              {getConversationPath(selectedNode).map((node, index) => (
+                <div key={node.id} style={{ marginBottom: '30px' }}>
+                  <div style={{ color: '#666666', fontSize: '11px', marginBottom: '8px', textTransform: 'lowercase' }}>
+                    question {index + 1}
+                  </div>
+                  <div style={{
+                    color: '#000000',
+                    fontSize: '12px',
+                    fontWeight: '500',
+                    marginBottom: '15px',
+                    padding: '12px',
+                    backgroundColor: '#f9f9f9',
+                    border: '1px solid #e0e0e0'
+                  }}>
+                    {node.question}
+                  </div>
 
-              <div style={{ color: '#666666', fontSize: '11px', marginBottom: '8px', textTransform: 'lowercase' }}>
-                answer
-              </div>
-              <div style={{
-                color: '#000000',
-                fontSize: '12px',
-                lineHeight: '1.6',
-                whiteSpace: 'pre-wrap',
-                marginBottom: '30px',
-                padding: '15px',
-                backgroundColor: '#f5f5f5',
-                border: '1px solid #cccccc'
-              }}>
-                {selectedNodeData.answer}
-              </div>
+                  <div style={{ color: '#666666', fontSize: '11px', marginBottom: '8px', textTransform: 'lowercase' }}>
+                    answer {index + 1}
+                  </div>
+                  <div style={{
+                    color: '#000000',
+                    fontSize: '12px',
+                    lineHeight: '1.6',
+                    whiteSpace: 'pre-wrap',
+                    padding: '15px',
+                    backgroundColor: '#f5f5f5',
+                    border: '1px solid #cccccc'
+                  }}>
+                    {node.id === selectedNode && loading && streamingAnswer ? streamingAnswer : node.answer}
+                    {node.id === selectedNode && loading && streamingAnswer && <span style={{ opacity: 0.6 }}>▊</span>}
+                  </div>
+                </div>
+              ))}
+              <div ref={chatEndRef} />
             </div>
 
-            <div style={{ marginTop: 'auto' }}>
-              <div style={{ color: '#666666', fontSize: '11px', marginBottom: '10px', textTransform: 'lowercase' }}>
-                follow up question
+            <div style={{
+              padding: '20px',
+              borderTop: '1px solid #cccccc',
+              backgroundColor: '#ffffff'
+            }}>
+              <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: '10px'
+              }}>
+                <div style={{ color: '#666666', fontSize: '11px', textTransform: 'lowercase' }}>
+                  follow up question
+                </div>
+                {feedbackMessage && (
+                  <div style={{
+                    color: '#00aa00',
+                    fontSize: '11px',
+                    fontStyle: 'italic',
+                    animation: 'fadeIn 0.3s'
+                  }}>
+                    {feedbackMessage}
+                  </div>
+                )}
               </div>
               <input
                 type="text"
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
-                placeholder="ask a follow up..."
+                placeholder="ask a follow up... (type /help for commands)"
                 style={{
                   width: '100%',
                   padding: '12px',
@@ -361,17 +626,17 @@ function CanvasView({ tree, onAsk, onClear }) {
             </div>
           </>
         ) : (
-          <div style={{ margin: 'auto', textAlign: 'center' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
             {Object.keys(tree.nodes).length === 0 ? (
-              <>
-                <div style={{ color: '#666666', fontSize: '11px', marginBottom: '20px', textTransform: 'lowercase' }}>
+              <div style={{ marginTop: 'auto' }}>
+                <div style={{ color: '#666666', fontSize: '11px', marginBottom: '10px', textTransform: 'lowercase' }}>
                   start conversation
                 </div>
                 <input
                   type="text"
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
-                  placeholder="ask a question..."
+                  placeholder="ask a question... (type /help for commands)"
                   style={{
                     width: '100%',
                     padding: '12px',
@@ -406,9 +671,9 @@ function CanvasView({ tree, onAsk, onClear }) {
                 >
                   {loading ? 'thinking...' : 'start'}
                 </button>
-              </>
+              </div>
             ) : (
-              <div style={{ color: '#666666', fontSize: '12px' }}>
+              <div style={{ margin: 'auto', color: '#666666', fontSize: '12px' }}>
                 click a node to view details
               </div>
             )}
